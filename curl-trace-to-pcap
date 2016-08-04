@@ -1,0 +1,145 @@
+#!/usr/bin/env perl
+
+# Transforms a curl trace file of an HTTP(s) request into a pcap dump
+#
+# Example:
+#    curl --trace sl.trace http://slashdot.org/
+#    curl-trace-to-pcap 127.0.0.1:40000 216.34.181.45:80 sl.trace sl.pcap
+#
+# Copyright 2016 Olivier Mengué
+# License: Apache License 2.0
+
+use strict;
+use warnings;
+
+use Net::Pcap;
+use Net::Frame::Layer::IPv4 qw(:consts);
+use Net::Frame::Layer::TCP qw(:consts);
+use Net::Frame::Simple ();
+
+@ARGV == 4 or die "usage: $0 <src:port> <dst:port> <trace> <pcap>";
+my ($src, $dst, $curl_trace_file, $pcap_file) = @ARGV;
+
+my ($src_ip, $src_port) = split /:/, $src;
+my ($dst_ip, $dst_port) = split /:/, $dst;
+
+my %state_in = (
+    tcp_seq => 1,
+);
+my %state_out = (
+    tcp_seq => 1,
+);
+my $ip_id = 0;
+
+
+sub build_packet
+{
+    my ($payload, $out) = @_;
+
+    # FIXME TCP details must be seriously fixed
+    my $tcp = Net::Frame::Layer::TCP->new(
+	src => $out ? $src_port : $dst_port,
+	dst => $out ? $dst_port : $src_port,
+	seq => $out ? $state_out{tcp_seq}++ : $state_in{tcp_seq}++,
+	flags => 0,
+	ack => $out ? $state_in{tcp_seq} : $state_out{tcp_seq},
+	x2 => 0,
+	off => 0,
+	payload => $payload,
+    );
+    my $ip4 = Net::Frame::Layer::IPv4->new(
+	version => 4,
+	tos => 0,
+	id => $ip_id++,
+	src => $out ? $src_ip : $dst_ip,
+	dst => $out ? $dst_ip : $src_ip,
+	protocol => NF_IPv4_PROTOCOL_TCP,
+	flags => 0,
+	offset => 0,
+    );
+
+    return Net::Frame::Simple->new(layers => [ $ip4, $tcp ])->pack;
+}
+
+
+#                         LINKTYPE_IPV4, snaplen
+my $pcap = pcap_open_dead(228,           65536);
+
+my $dump = pcap_dump_open($pcap, $pcap_file) or die "Can't open $pcap_file: ".pcap_geterr();
+
+open my $trace, '<', $curl_trace_file or die "Can't open $curl_trace_file: $!";
+
+my $out = 1;
+my @payload;
+my $next_offset = 0;
+my $expected = 0;
+my $tv = time*10;
+
+sub send_payload
+{
+    return unless @payload;
+    my $payload = join('', @payload);
+    if (length($payload) != $expected) {
+	warn "Unexpected length: ".length($payload)."\n";
+    }
+    my $pkt = build_packet($payload, $out);
+    pcap_dump($dump,
+	{
+	    len => length($pkt),
+	    caplen => length($pkt),
+	    tv_sec => ($tv / 10),
+	    tv_usec => ($tv % 10) * 100_000,
+	},
+	$pkt);
+    printf "%5.1f %d bytes\n", $tv/10, length($payload);
+    $tv++;
+    @payload = ();
+    $next_offset = 0;
+}
+
+while (<$trace>) {
+    if (/^([0-9a-f]{4}): ((?:[0-9a-f]{2} ){1,16})./) {
+	chomp;
+	my $offset = hex $1;
+	my $hex = $2;
+
+	if ($offset != $next_offset) {
+	    warn "Skip line $.: $_\n";
+	    next;
+	}
+
+	if ($offset == 0 && @payload) {
+	    warn "Flush because of line $.\n";
+	    send_payload;
+	}
+	$hex =~ s/ //g;
+	my $buf = pack('H*', $hex);
+
+	if (length($_) != 54+length($buf)) {
+	    warn "Skip line $.: $_\n";
+	    next
+	}
+
+	push @payload, $buf;
+	$next_offset += length($buf);
+
+	send_payload if length($buf) < 16;
+
+    } elsif (/^=> Send .*, ([1-9][0-9]*) bytes \(0x[0-9a-f]+\)$/) {
+	my $b = $1;
+	send_payload if @payload;
+	$out = 1;
+	$expected = $b;
+    } elsif (/^<= Recv .*, ([1-9][0-9]*) bytes \(0x[0-9a-f]+\)$/) {
+	my $b = $1;
+	send_payload if @payload;
+	$out = 0;
+	$expected = $b;
+    }
+}
+
+close($trace);
+send_payload if @payload;
+
+pcap_dump_close($dump);
+pcap_close($pcap);
