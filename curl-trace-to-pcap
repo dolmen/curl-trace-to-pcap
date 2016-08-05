@@ -23,11 +23,14 @@ my ($src, $dst, $curl_trace_file, $pcap_file) = @ARGV;
 my ($src_ip, $src_port) = split /:/, $src;
 my ($dst_ip, $dst_port) = split /:/, $dst;
 
+use constant SEQ_INIT => 5;
 my %state_in = (
-    tcp_seq => 1,
+    tcp_seq => SEQ_INIT,
+    tcp_ack => 0,
 );
 my %state_out = (
-    tcp_seq => 1,
+    tcp_seq => SEQ_INIT,
+    tcp_ack => 0,
 );
 my $ip_id = 0;
 
@@ -37,16 +40,31 @@ sub build_packet
     my ($payload, $out) = @_;
 
     # FIXME TCP details must be seriously fixed
+    my $r_seq = $out ? \$state_out{tcp_seq} : \$state_in{tcp_seq};
+    my $seq = $$r_seq;
+    my $is_SYN = $seq == SEQ_INIT;
+    my $ack = $out ? $state_in{tcp_seq} : $state_out{tcp_seq};
+    my $save_ack = $out ? \$state_out{tcp_ack} : \$state_in{tcp_ack};
+    $ack = 0 if ($out && $is_SYN);
+    #print "Seq=$seq Ack=$ack\n";
     my $tcp = Net::Frame::Layer::TCP->new(
 	src => $out ? $src_port : $dst_port,
 	dst => $out ? $dst_port : $src_port,
-	seq => $out ? $state_out{tcp_seq}++ : $state_in{tcp_seq}++,
-	flags => 0,
-	ack => $out ? $state_in{tcp_seq} : $state_out{tcp_seq},
+	flags => (
+	      (length($payload) ? NF_TCP_FLAGS_PSH : 0)
+	    | ($is_SYN ? NF_TCP_FLAGS_SYN : 0)
+	    | ($ack ? NF_TCP_FLAGS_ACK : 0)
+	),
+	seq => $seq,
+	ack => $ack,
 	x2 => 0,
 	off => 0,
+	win => 0xffff,
 	payload => $payload,
     );
+    $$save_ack = $ack if $ack;
+    $$r_seq += $is_SYN ? 1 : length($payload);
+
     my $ip4 = Net::Frame::Layer::IPv4->new(
 	version => 4,
 	tos => 0,
@@ -77,7 +95,6 @@ my $tv = time*10;
 
 sub send_payload
 {
-    return unless @payload;
     my $payload = join('', @payload);
     if (length($payload) != $expected) {
 	warn "Unexpected length: ".length($payload)."\n";
@@ -95,7 +112,18 @@ sub send_payload
     $tv++;
     @payload = ();
     $next_offset = 0;
+    $expected = undef;
 }
+
+
+# Initial SYN
+$out = 1;
+$expected = 0;
+send_payload;
+# Initial SYN,ACK
+$out = 0;
+$expected = 0;
+send_payload;
 
 while (<$trace>) {
     if (/^([0-9a-f]{4}): ((?:[0-9a-f]{2} ){1,16})./) {
@@ -104,12 +132,13 @@ while (<$trace>) {
 	my $hex = $2;
 
 	if ($offset != $next_offset) {
+	    warn "Unexpected offset $1\n";
 	    warn "Skip line $.: $_\n";
 	    next;
 	}
 
 	if ($offset == 0 && @payload) {
-	    warn "Flush because of line $.\n";
+	    warn "Flush because of line $.: $_\n";
 	    send_payload;
 	}
 	$hex =~ s/ //g;
@@ -140,6 +169,13 @@ while (<$trace>) {
 
 close($trace);
 send_payload if @payload;
+
+# Final ack
+$out = !$out;
+$expected = 0;
+send_payload;
+
+# TODO Send FIN packets
 
 pcap_dump_close($dump);
 pcap_close($pcap);
