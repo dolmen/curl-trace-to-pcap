@@ -39,7 +39,6 @@ sub build_packet
 {
     my ($payload, $out) = @_;
 
-    # FIXME TCP details must be seriously fixed
     my $r_seq = $out ? \$state_out{tcp_seq} : \$state_in{tcp_seq};
     my $seq = $$r_seq;
     my $is_SYN = $seq == SEQ_INIT;
@@ -58,9 +57,10 @@ sub build_packet
 	seq => $seq,
 	ack => $ack,
 	x2 => 0,
-	off => 0,
 	win => 0xffff,
 	payload => $payload,
+	# Window scaling 14 bits (RFC1323)
+	($is_SYN ? (options => "\x03\x03\x0E\x00", off => 6) : (off => 5)),
     );
     $$save_ack = $ack if $ack;
     $$r_seq += $is_SYN ? 1 : length($payload);
